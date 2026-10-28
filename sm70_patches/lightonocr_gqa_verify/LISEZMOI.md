@@ -224,3 +224,26 @@ Désormais, ces métadonnées sont construites **une fois par pas**, à la premi
 Le cache est indexé par l'objet `attn_metadata`, avec un garde-fou : il n'est réutilisé que si `query_start_loc` et `seq_lens` sont identiques. Le test `test_patch.py` couvre ce cas (c') : 8 couches de suite avec le même objet, puis un objet réutilisé avec des `seq_lens` changés, qui doit être reconstruit ; les deux sont OK.
 
 **À recopier dans `scripts/vllm_ext/patchs/`** : la version de production est celle de 12:47.
+
+---
+
+# Patch de diagnostic `diag_cpu_pas` (sortie inchangée)
+
+Il chronomètre par pas, au temps mur, les méthodes suivantes :
+- `EngineCore.step` ;
+- `Scheduler.schedule` et `Scheduler.update_from_output` ;
+- dans `GPUModelRunner` : `execute_model`, `_update_states`, `_prepare_inputs`, `sample_tokens`, `_sample`, `_bookkeeping_sync`, `propose_draft_token_ids`.
+
+Il mesure aussi `écart_gpu` : l'intervalle sur le GPU (événements CUDA) entre la fin du travail enfilé par `execute_model` et le début du pas suivant. Cet intervalle comprend environ 3 ms de noyaux d'échantillonnage et le GPU inoccupé.
+
+Toutes les `DIAG_CPU_N` pas (200 par défaut), il écrit sur stderr et dans le journal :
+```
+diag_cpu_pas décodage n=… step=… schedule=… update=… execute=… update_states=… prepare_inputs=… sample_tokens=… _sample=… bookkeeping=… propose=… écart_gpu=… (ms/pas)
+```
+Les temps sont inclusifs. `sample_tokens` contient l'attente de la fin du forward.
+
+Pour l'activer :
+1. Copier `diag_cpu_pas.py`.
+2. Ajouter `"diag_cpu_pas"` à `actifs`. La cible est `vllm.v1.worker.gpu_model_runner` : le patch s'applique dans le processus EngineCore, avant que `EngineCore.step_fn` soit lié.
+
+`DIAG_CPU=0` le neutralise. Test : `test_diag_cpu.py`, avec de faux modules (chronos, classement décodage/mixte, écart GPU, sorties inchangées) : OK.
