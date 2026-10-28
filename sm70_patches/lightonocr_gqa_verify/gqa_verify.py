@@ -260,6 +260,8 @@ class GQAVerifyAttention:
         block_m = max(16, triton.next_power_of_2(g * maxq))
         n_parts = self.num_partitions(kv_capacity)
         po, pm, pl = self.workspace(n_tokens, hq, n_parts, d, query.device)
+        if self.backend == "cuda" and not charger_cuda():
+            raise RuntimeError("gqa_verify : extension CUDA introuvable (build/gqa_verify_cuda.so)")
         use_cuda = self.backend == "cuda" or (
             self.backend == "auto" and g == 4 and d == 256 and maxq <= 8
             and self.partition_size % 32 == 0 and charger_cuda())

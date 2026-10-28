@@ -39,6 +39,7 @@ Pourquoi CUDA et pas seulement Triton : sur sm_70, Triton 3.6 compile `tl.dot` e
 | `build/gqa_verify_cuda.so` | Extension compilée pour `ocr/1cat-vllm:1.5.1` (torch 2.10, CUDA 12.8, sm_70) |
 | `test_gqa_verify.py` | Test du noyau aux formes de production : référence fp32, noyau du fork, cas limites, chronos |
 | `test_patch.py` | Test du branchement : aiguillage, replis, graphe CUDA, lot mixte, vrai module du fork |
+| `banc_parties.py` | Banc : passe partition seule, réduction seule, appel complet |
 
 ## Ce que le patch remplace
 
@@ -113,6 +114,16 @@ Conditions : V100 partagé avec la production en cours. Le noyau du fork y prend
 | Contexte long (9 000 et 7 777) | 3,4e-5 | 3,3e-5 | – | – |
 | Remplissage de graphe (+12 jetons hors requête) | 7,4e-5 ; sortie de remplissage nulle : oui | 9,4e-5 | – | – |
 | Requête à 0 jeton au milieu du lot | 1,1e-4 | 1,4e-4 | – | – |
+
+Banc alterné, plus fiable sous contention (`banc_parties.py` et `out/profil_gpu/v1/banc_v1v2.py`). On a fait 10 tours alternés de 10 appels chacun, au format de production :
+
+| Noyau | Médiane | Minimum |
+|---|---:|---:|
+| Nouveau noyau | 2,05 ms | 1,18 ms |
+| Noyau du fork | 12,5 ms | 8,8 ms |
+| **Gain** | **×6,1** | **×7,5** |
+
+La réduction Triton ne coûte que 0,04 ms. Une variante v2 (K et V en double tampon, Q·Kᵀ sur 8 warps, 95 Ko de mémoire partagée) n'a rien gagné (médiane 2,04 ms) : elle a été écartée, et c'est v1 qui est livrée.
 
 Autres constats :
 - **Par rapport au noyau actuel**, l'écart max est de 2,4e-4 (environ 1 ulp fp16 sur ces magnitudes) et 51 % des valeurs sont identiques au bit près. Ce n'est donc pas identique à l'octet, et il faut valider sur les jeux de qualité. Le nouveau noyau est légèrement plus proche de la référence fp32 que l'ancien.
