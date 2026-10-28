@@ -35,6 +35,7 @@ except Exception:  # noqa: BLE001
     import gqa_verify as _gv  # type: ignore
 
 _ETAT = {"appels": 0, "replis": {}, "mixte": 0}
+_MIXTE: dict = {}
 _ATT = None
 
 
@@ -161,27 +162,47 @@ def appliquer(module) -> None:
             _repli("mixte:" + raison, logger)
             return orig_mixte(self, layer, query, key_cache, value_cache, attn_metadata, out_view,
                               query_start_loc, seq_lens, window_size)
+        # Métadonnées compactes construites une fois par pas (les 8 couches partagent attn_metadata) et
+        # copiées sans synchronisation (mémoire épinglée, non_blocking). Le cache garde une référence à
+        # l'objet attn_metadata : son id ne peut pas être réutilisé tant qu'il est en cache.
         num_seqs = len(query_start_loc) - 1
-        qsl = [int(x) for x in query_start_loc[: num_seqs + 1].tolist()]
-        sl_h = [int(x) for x in seq_lens[:num_seqs].tolist()]
-        max_q = max(1, int(self.smallq_decode_max_query_len))
-        rows = [i for i in range(num_seqs) if 1 <= qsl[i + 1] - qsl[i] <= max_q and sl_h[i] > qsl[i + 1] - qsl[i]]
-        if not rows or len(rows) == num_seqs:
+        c = None
+        if _MIXTE.get("meta") is attn_metadata:
+            qc, sc = _MIXTE["cles"]
+            # garde-fou si l'objet était réutilisé d'un pas à l'autre : mêmes bornes et mêmes longueurs
+            if (qc.shape[0] == num_seqs + 1 and torch.equal(qc, query_start_loc[: num_seqs + 1].to(qc.device))
+                    and torch.equal(sc, seq_lens[:num_seqs].to(sc.device))):
+                c = _MIXTE["data"]
+        if c is None:
+            qsl = [int(x) for x in query_start_loc[: num_seqs + 1].tolist()]
+            sl_h = [int(x) for x in seq_lens[:num_seqs].tolist()]
+            max_q = max(1, int(self.smallq_decode_max_query_len))
+            rows = [i for i in range(num_seqs) if 1 <= qsl[i + 1] - qsl[i] <= max_q and sl_h[i] > qsl[i + 1] - qsl[i]]
+            if not rows or len(rows) == num_seqs:
+                c = (set(),)
+            else:
+                dev = query.device
+                tok, cqsl = [], [0]
+                for i in rows:
+                    tok.extend(range(qsl[i], qsl[i + 1]))
+                    cqsl.append(cqsl[-1] + qsl[i + 1] - qsl[i])
+
+                def gpu(vals, dtype):
+                    return torch.tensor(vals, dtype=dtype).pin_memory().to(dev, non_blocking=True)
+
+                start_idx = gpu(tok, torch.long)
+                bt = attn_metadata.block_table.index_select(0, gpu(rows, torch.long))
+                if bt.dtype != torch.int32:
+                    bt = bt.to(torch.int32)
+                bt = bt.contiguous()
+                c = (set(rows), start_idx, bt, gpu([sl_h[i] for i in rows], torch.int32), gpu(cqsl, torch.int32), max_q)
+            _MIXTE["meta"], _MIXTE["data"] = attn_metadata, c
+            _MIXTE["cles"] = (query_start_loc[: num_seqs + 1].detach().cpu().clone(), seq_lens[:num_seqs].detach().cpu().clone())
+        if not c[0]:
             return set()
-        dev = query.device
-        tok, cqsl = [], [0]
-        for i in rows:
-            tok.extend(range(qsl[i], qsl[i + 1]))
-            cqsl.append(cqsl[-1] + qsl[i + 1] - qsl[i])
-        start_idx = torch.tensor(tok, device=dev, dtype=torch.long)
+        rows_set, start_idx, bt, sl_t, qsl_t, max_q = c
         q_rows = query.index_select(0, start_idx)
         out_rows = torch.empty_like(q_rows)
-        bt = attn_metadata.block_table.index_select(0, torch.tensor(rows, device=dev, dtype=torch.long))
-        if bt.dtype != torch.int32:
-            bt = bt.to(torch.int32)
-        bt = bt.contiguous()
-        sl_t = torch.tensor([sl_h[i] for i in rows], device=dev, dtype=torch.int32)
-        qsl_t = torch.tensor(cqsl, device=dev, dtype=torch.int32)
         _att()(q_rows, key_cache, value_cache, bt, sl_t, qsl_t, out_rows, scale=float(self.scale),
                max_query_len=max_q, kv_capacity=_capacite(self, attn_metadata, attn_metadata.block_table, key_cache),
                softcap=float(getattr(self, "logits_soft_cap", 0.0) or 0.0), per_token=False)
@@ -191,7 +212,7 @@ def appliquer(module) -> None:
             module._record_route("prefill_prefix_decode_rows_gqa_verify")
         except Exception:  # noqa: BLE001
             pass
-        return set(rows)
+        return set(rows_set)
 
     smallq.__wrapped__ = orig_smallq
     Impl._flash_v100_small_query_prefill_as_decode = smallq

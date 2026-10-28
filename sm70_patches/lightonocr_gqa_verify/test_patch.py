@@ -150,6 +150,24 @@ e = (outm[dec.to(dev)].float() - refm[dec.to(dev)]).abs().max().item()
 verifie("c) lignes rendues = {1, 2, 4, 5}", rows == {1, 2, 4, 5}, str(rows))
 verifie("c) lignes petit q = référence", e < 5e-4, f"écart max {e:.2e}")
 verifie("c) lignes de prefill intactes", bool((outm[~dec.to(dev)] == 7.0).all()))
+# c') même attn_metadata pour 8 couches (cache par pas), puis pas suivant avec seq_lens +1 (nouvel objet)
+ok_c = True
+for couche in range(8):
+    qm2 = torch.randn_like(qm)
+    o2 = torch.full_like(outm, 7.0)
+    r2 = impl._run_prefill_prefix_decode_rows(layer, qm2, kc, vc, mm, o2, qslm.cpu(), slm.cpu(), (-1, -1))
+    torch.cuda.synchronize()
+    ref2 = reference(qm2, kc, vc, btm, slm, qslm, PAGE, Tm)
+    ok_c &= r2 == {1, 2, 4, 5} and (o2[dec.to(dev)].float() - ref2[dec.to(dev)]).abs().max().item() < 5e-4
+verifie("c') 8 couches avec le même attn_metadata (cache)", ok_c)
+slm3 = slm + torch.tensor([0, 1, 1, 0, 1, 1], dtype=slm.dtype, device=dev)
+mm.seq_lens = slm3  # même objet réutilisé avec d'autres longueurs : le garde-fou doit reconstruire
+o3 = torch.full_like(outm, 7.0)
+impl._run_prefill_prefix_decode_rows(layer, qm, kc, vc, mm, o3, qslm.cpu(), slm3.cpu(), (-1, -1))
+torch.cuda.synchronize()
+ref3 = reference(qm, kc, vc, btm, slm3, qslm, PAGE, Tm)
+e3 = (o3[dec.to(dev)].float() - ref3[dec.to(dev)]).abs().max().item()
+verifie("c') objet réutilisé avec seq_lens changés → reconstruit", e3 < 5e-4, f"écart max {e3:.2e}")
 
 if "--vrai" in sys.argv:
     import importlib

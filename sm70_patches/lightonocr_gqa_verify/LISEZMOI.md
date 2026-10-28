@@ -147,3 +147,80 @@ Autres constats :
 - **Occupation** : 1 CTA par SM (75 Ko de mémoire partagée, 8 warps), environ 340 Go/s utiles estimés hors contention. Une version à 2 CTA par SM ou à double tampon pourrait encore diviser le temps par environ 2 (environ −4 ms par pas, +2 à 3 %).
 - **Variante Triton** (`GQA_VERIFY_BACKEND=triton`) : correcte mais seulement 1,1 à 1,2× plus rapide (FMA sur sm_70). Elle n'est jamais choisie automatiquement.
 - **Le `.so` dépend de l'image** `ocr/1cat-vllm:1.5.1`. Il faut le recompiler avec `construire.py` si l'image change.
+
+---
+
+# Patch `vit_attn_fa` : attention de la tour vision (FlashAttention WMMA sm_70, d = 64)
+
+## Ce qu'il fait
+
+`MMEncoderAttention._forward_sdpa` (module `vllm.model_executor.layers.attention.mm_encoder_attention`) est le chemin TORCH_SDPA de la tour vision Qwen3-VL de LightOnOCR-3-4B : 24 couches, 16 têtes, d = 64, non causale.
+
+Le patch la remplace par le noyau `csrc/vit_fa_cuda.cu` (op `torch.ops.vit_fa.forward`, `build/vit_fa_cuda.so`). C'est une FlashAttention avant sur cœurs tenseurs :
+- une CTA par (64 requêtes, tête, séquence), 4 warps × 16 lignes, blocs de 32 clés, 4 CTA par SM ;
+- S passe par la mémoire partagée, la softmax est en ligne fp32 avec base 2 ;
+- l'accumulateur reste dans les fragments WMMA, avec une **remise à l'échelle paresseuse exacte** : elle n'a lieu que si le max d'une ligne dépasse de 8 (en log2) le max de référence, et P = 2^(s − m_ref) ≤ 256.
+
+**Second gain** : l'original fait `cu_seqlens.tolist()` sur un tenseur GPU dans chaque couche, donc 24 synchronisations par image. Le profil de 13:30 en compte environ 10 ms de trous par pas mixte. Le patch n'en fait aucune : la grille est bornée par la longueur totale, connue de l'hôte, et chaque CTA lit les bornes de sa séquence sur le GPU.
+
+Repli vers l'original dans les cas suivants :
+- `VIT_FA=0` ;
+- extension absente ;
+- dtype autre que fp16 ;
+- `head_dim` ≠ 64 ou GQA ;
+- lot > 1 sans `cu_seqlens`, ou q et kv de longueurs différentes ;
+- `cu_seqlens` qui n'est pas en int32 sur le GPU.
+
+## Activation
+
+1. Copier `vit_attn_fa.py` et `build/vit_fa_cuda.so` (dans `build/`, ou via `VIT_FA_SO`) dans `scripts/vllm_ext/patchs/`.
+2. Ajouter `"vit_attn_fa"` à `actifs`.
+
+Au démarrage, le log doit montrer « vit_attn_fa : patch appliqué (extension=True) », puis au premier prefill « attention vision par le noyau FA WMMA sm70 ».
+
+`VIT_FA_VARIANTE=64` choisit les blocs de 64 clés (2 CTA par SM). Cette variante est moins bonne.
+
+## Résultats (28/10, vers 13:50 UTC, GPU partagé avec la production)
+
+Les sorties brutes sont dans `out/profil_gpu/tests/test_vit_fa_v3_32.json`.
+
+| Cas | Écart max / moyen vs fp32 | SDPA actuelle (max / moyen) | Nouveau vs actuel |
+|---|---|---|---|
+| Colonne de 5 888 patchs | 9,5e-4 / 1,7e-5 | 9,2e-4 / 1,5e-5 | max 9,8e-4 (1 ulp fp16), 55 % identiques |
+| Bandeau de 256 | 1,4e-3 / 5,1e-5 | 9,7e-4 / 4,3e-5 | max 2,0e-3 (1 ulp sur des valeurs ≈ 2,5) |
+| 5 900 (dernier bloc partiel), 77, 1 | ≤ 1,2e-3 | ≤ 9,7e-4 | ≤ 1 ulp |
+| 2 images (5 888 + 1 012), 3 images (64 + 65 + 130) | ≤ 1,6e-3 | ≤ 1,0e-3 | ≤ 1 ulp, pas de fuite entre images |
+
+**Vitesse** : banc alterné `banc_vit.py`, 15 tours, colonne de 5 888 patchs.
+
+| Noyau | Meilleur temps | Médiane |
+|---|---:|---:|
+| SDPA actuelle | 5,31 ms (26,8 TFLOPS) | 10,7 ms |
+| `vit_fa` variante 32 | **4,54 ms** (31,3 TFLOPS) | **8,65 ms** |
+| `vit_fa` variante 64 | 5,11 ms | 10,4 ms |
+
+Gain du noyau : **×1,17** au meilleur temps, **×1,23** en médiane. La SDPA au meilleur temps (5,3 ms) correspond à la trace de production (5,2 ms par appel pour une colonne).
+
+`test_vit_patch.py`, sur le vrai module du fork : **10/10 OK**.
+- La méthode patchée est égale à l'originale (`__wrapped__`) à 1 ulp près, pour une colonne de 5 888, 2 images, un `cu_seqlens` rembourré de séquences vides, et une entrée 4D sans `cu_seqlens`.
+- Replis vérifiés : d = 80, fp32, lot de 2, `VIT_FA=0`.
+
+**Gain attendu en production** : l'attention vision pèse 12,6 % du GPU, et environ 10 ms de trous par pas mixte disparaissent. Cela donne environ **+3 à +4 % de tuiles/s**. C'est à valider par `scripts/valider_ocr.sh` : pas identique à l'octet, à 1 ulp près sur la sortie de la tour vision.
+
+## Limites
+
+- **Gain modeste** sur le noyau lui-même (×1,2). Les allers-retours de S et P par la mémoire partagée, imposés par WMMA, coûtent cher. Il faudrait écrire `mma.sync` m8n8k4 directement, avec la softmax en registres, pour viser ×2 : c'est un travail de plusieurs jours.
+- Pas de GQA, d = 64 seulement, fp16 seulement.
+- Les séquences multiples sont surdimensionnées en grille (nseq × ⌈S/64⌉ CTA, celles hors séquence sortent aussitôt) : c'est négligeable pour 1 ou 2 images.
+
+---
+
+# Mise à jour d'`attn_gqa_verify` (28/10, 13:55) : lots mixtes sans copies synchrones
+
+Avant, dans les pas mixtes, chacune des 8 couches reconstruisait les métadonnées compactes des lignes petit q, avec 4 `torch.tensor(..., device=cuda)`, donc des copies H2D synchrones. Le profil de 13:30 y attribuait `index_select` 2,9 ms et une partie des `aten::to`/`copy_`.
+
+Désormais, ces métadonnées sont construites **une fois par pas**, à la première couche, et copiées depuis de la mémoire épinglée en `non_blocking`.
+
+Le cache est indexé par l'objet `attn_metadata`, avec un garde-fou : il n'est réutilisé que si `query_start_loc` et `seq_lens` sont identiques. Le test `test_patch.py` couvre ce cas (c') : 8 couches de suite avec le même objet, puis un objet réutilisé avec des `seq_lens` changés, qui doit être reconstruit ; les deux sont OK.
+
+**À recopier dans `scripts/vllm_ext/patchs/`** : la version de production est celle de 12:47.
