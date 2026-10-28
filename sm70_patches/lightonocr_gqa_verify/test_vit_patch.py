@@ -52,6 +52,19 @@ for nom, lens in (("1 colonne 5 888", [5888]), ("2 images 1 024 + 777", [1024, 7
     e = (a.float() - b.float()).abs().max().item()
     verifie(f"{nom} : patché ≈ original", a.shape == b.shape and e < 4e-3 and not torch.isnan(a).any(),
             f"forme {tuple(a.shape)} écart max {e:.1e}")
+# disposition réelle de Qwen2_5_VisionAttention : qkv [1, S, 3, H, D], q/k rotés contigus, v = qkv[:, :, 2] (vue)
+S = 5888
+qkv5 = torch.randn((1, S, 3, H, D), dtype=torch.float16, device=dev)
+qk = qkv5[:, :, :2].permute(2, 0, 1, 3, 4).contiguous()  # « rotation » : copie contiguë
+qr, kr = qk.unbind(0)
+vr = qkv5[:, :, 2]
+cu = torch.tensor([0, S], dtype=torch.int32, device=dev)
+o = instance()
+a, b = Cls._forward_sdpa(o, qr * 2, kr, vr, cu), orig(o, qr * 2, kr, vr, cu)
+torch.cuda.synchronize()
+e = (a.float() - b.float()).abs().max().item()
+verifie("disposition Qwen3-VL (q/k contigus, v vue de qkv)", a.shape == b.shape == (1, S, H, D) and e < 4e-3,
+        f"{tuple(a.shape)} écart max {e:.1e} ; appels noyau {P._ETAT['appels']}")
 # 4D sans cu_seqlens
 q4 = torch.randn((1, 500, H, D), dtype=torch.float16, device=dev)
 k4, v4 = torch.randn_like(q4), torch.randn_like(q4)
